@@ -1,0 +1,300 @@
+# Databricks notebook source
+# MAGIC %md
+# MAGIC ### Step 1: Move the uploaded data into s3a raw layer, Take a look at the txt.gz file layout
+
+# COMMAND ----------
+
+list_of_filtered_files = list(filter(lambda x: x.path.find("takeda_") > 0, dbutils.fs.ls("FileStore/tables/")))
+print(list_of_filtered_files)
+
+# COMMAND ----------
+
+for file_obj in list_of_filtered_files:
+#   print(file_obj.path, file_obj.name, file_obj.size)
+   dbutils.fs.mv(file_obj.path, "s3a://CDW/Tx_2019 + file_obj.name)
+
+# COMMAND ----------
+
+list_of_filtered_files = list(filter(lambda x: x.path.find("t_") > 0, dbutils.fs.ls("s3a://CDW/Tx_2019/")))
+print(len(list_of_filtered_files))
+
+# COMMAND ----------
+
+# MAGIC %fs head 's3a://spkr_pgm_20200501.txt'
+
+# COMMAND ----------
+
+# MAGIC %sh
+# MAGIC pip3 install xlrd
+
+# COMMAND ----------
+
+import pandas as pd
+import xlrd
+data_dict = pd.read_excel('s3a://data_dictionary.xlsx', sheetname='Sheet1', header = 'true', index_col=0)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC
+# MAGIC ### Step 2: Read files, convert to Delta tables stored at AWS S3 bucket lake layer
+
+# COMMAND ----------
+
+from pyspark.sql.types import *
+def pt_schema():
+    schema = StructType([
+    StructField("record_id", LongType()),
+    StructField("type", StringType()),
+    StructField("patient_id", LongType()),
+    StructField("transaction_day", IntegerType()),
+    StructField("transaction_month", IntegerType()),
+    StructField("transaction_year", IntegerType()),
+    StructField("transaction_daTe", DateType()),
+    StructField("product_id", StringType()),
+    StructField("ta1", StringType()),
+    StructField("ta2", StringType()),
+    StructField("ta3", StringType()),
+    StructField("prescription_num", IntegerType()),
+    StructField("qty_dispensed", DoubleType()),
+    StructField("days_supply", IntegerType()),
+    StructField("unit_of_measure", StringType()),
+    StructField("fill_number", IntegerType()),
+    StructField("num_authorized_refills", IntegerType()),
+    StructField("patient_opc", DoubleType()),
+    StructField("total_payment", DoubleType()),
+    StructField("payment_type", IntegerType()),
+    StructField("payment_type_desc", StringType()),
+    StructField("place_of_service", StringType()),
+    StructField("place_of_service_name", StringType()),
+    StructField("age", StringType()),
+    StructField("gender", StringType()),
+    StructField("zip3", StringType()),
+    StructField("state", StringType()),
+    StructField("vid", LongType()),
+    StructField("npi", LongType()),
+    StructField("csx_primary_payer_plan_id", StringType()),
+    StructField("primary_plan_paid", DoubleType()),
+    StructField("csx_last_payer_plan_id", StringType()),
+    StructField("last_plan_paid", DoubleType()),
+    StructField("num_payers", IntegerType()),
+    StructField("primary_payer_type", StringType()),
+    StructField("last_payer_type", StringType()),
+    StructField("payer_flag", IntegerType()),
+    StructField("claim_id", StringType()),
+    StructField("facility_npi", IntegerType()),
+    StructField("hco_vid", LongType()),
+    StructField("line_charges", DoubleType()),
+    StructField("units_of_service", DoubleType()),
+    StructField("procedure_code", StringType()),
+    StructField("procedure_code_desc", StringType()),
+    StructField("procedure_code_modifier1", StringType()),
+    StructField("diagnosis_code_1", StringType()),
+    StructField("diagnosis_code_2", StringType()),
+    StructField("hcp_specialty_1", StringType()),
+    StructField("hcp_specialty_2", StringType()),
+    StructField("nucc_hcp_specialty_1", StringType()),
+    StructField("nucc_hcp_specialty_2", StringType())
+    ])
+    
+    return schema
+
+# COMMAND ----------
+
+.option('inferSchema', 'true')
+.option("samplingRatio", 0.5)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC #####Step 2.1 HAE data
+
+# COMMAND ----------
+
+HAE_Pt = (spark.read 
+          .option("header", "true") 
+          .option("sep", "|")
+          .csv('s3a://CDW/Tx_2019/spkr_pgm_20200501.txt', inferSchema = 'true')
+     )
+
+# COMMAND ----------
+
+len(HAE_Pt.columns)
+
+# COMMAND ----------
+
+HAE_Pt.printSchema()
+
+# COMMAND ----------
+
+display(HAE_Pt.select(HAE_Pt.columns[0:36]))
+
+# COMMAND ----------
+
+display(HAE_Pt.select(HAE_Pt.columns[36:]))
+
+# COMMAND ----------
+
+(HAE_Pt
+ .repartition(12)
+ .write
+ .format("delta")
+ .mode("overwrite")
+ .option("overwriteSchema", "true")
+ .save("s3a://Veeva/PT/HAE_2020")
+     )
+
+# COMMAND ----------
+
+# MAGIC %scala
+# MAGIC val fileNm = dbutils.fs.ls("s3a://tmp/").map(_.name).filter(r => r.endsWith(".parquet"))
+# MAGIC println(fileNm(0))
+# MAGIC
+# MAGIC for file_obj in fileNm:
+# MAGIC   val fileLoc = "s3a://" + file_obj
+# MAGIC   dbutils.fs.mv(fileLoc, "s3a://tmp/"+file_obj)
+
+# COMMAND ----------
+
+# MAGIC %fs 
+# MAGIC ls "s3a://tmp/Laad Patient MPD.parquet"
+
+# COMMAND ----------
+
+def sourceDF(DF, filename, schema):
+
+  deltaDF = (spark.read
+      .format('delta')
+      .load("s3a://Veeva/PT/%s" %filename)
+      )
+  
+  DF_ct  = DF.count()
+  deltaDF_ct = deltaDF.count()
+
+  return deltaDF, "Original %s count: %s, Delta table count: %s, counts equal: %s" %(filename, DF_ct, deltaDF_ct, deltaDF_ct==DF_ct)
+
+# COMMAND ----------
+
+(HAE_Pt_delta, HAE_Pt_counts) = sourceDF(HAE_Pt, "HAE_2020", pt_schema())
+print(HAE_Pt_counts)
+
+# COMMAND ----------
+
+sc.defaultParallelism
+
+# COMMAND ----------
+
+HAE_Pt.rdd.getNumPartitions()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC #####Step 2.2 Hemophilia data
+
+# COMMAND ----------
+
+Hemophilia_Pt = (spark.read 
+          .option('inferSchema', 'true')
+          .option("header", "false") 
+          .option("sep", "|")
+          .csv('s3a://PT/hemophilia_patient_20200515.psv.gz')
+     )
+
+# COMMAND ----------
+
+display(Hemophilia_Pt)
+
+# COMMAND ----------
+
+Hemophilia_Pt = (spark.read 
+          .schema(pt_schema())
+          .option("header", "false") 
+          .option("sep", "|")
+          .csv('s3a://PT/hemophilia_patient_20200515.psv.gz')
+     )
+
+# COMMAND ----------
+
+display(Hemophilia_Pt.select(Hemophilia_Pt.columns[0:36]))
+
+# COMMAND ----------
+
+display(Hemophilia_Pt.select(Hemophilia_Pt.columns[36:]))
+
+# COMMAND ----------
+
+(Hemophilia_Pt.write
+ .format("delta")
+ .mode("overwrite")
+ .option("overwriteSchema", "true")
+ .save("s3a://PT/Hemophilia_2020")
+     )
+
+# COMMAND ----------
+
+#### direct write a table with meta data
+(Hemophilia_Pt.write
+ .format("delta")
+ .mode("overwrite")
+ .option("overwriteSchema", "true")
+ .option('path', "s3a://Veeva/PT/Hemophilia_2020")
+ .saveAsTable("com_us_lake.Veeva_PT_Hemophilia_2020")
+
+# COMMAND ----------
+
+(Hemophilia_Pt_delta, Hemophilia_Pt_counts) = sourceDF(Hemophilia_Pt, "Hemophilia_2020", pt_schema())
+print(Hemophilia_Pt_counts)
+
+# COMMAND ----------
+
+Hemophilia_Pt.rdd.getNumPartitions()
+
+# COMMAND ----------
+
+display()
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC select distinct transaction_year, count(*)
+# MAGIC from com_us_lake.Veeva_PT_Hemophilia_2020
+# MAGIC group by transaction_year
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ###Step 3: Create table pointer for the data
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC
+# MAGIC DROP TABLE IF EXISTS com_us_lake.Veeva_PT_HAE_2020;
+# MAGIC
+# MAGIC -- Create HAE table
+# MAGIC
+# MAGIC CREATE TABLE IF NOT EXISTS com_us_lake.Veeva_PT_HAE_2020
+# MAGIC USING DELTA
+# MAGIC LOCATION 's3a://Veeva/PT/HAE_2020';
+# MAGIC
+# MAGIC
+# MAGIC DROP TABLE IF EXISTS com_us_lake.Veeva_PT_Hemophilia_2020;
+# MAGIC
+# MAGIC -- Create Hemophilia table
+# MAGIC
+# MAGIC CREATE TABLE IF NOT EXISTS com_us_lake.Veeva_PT_Hemophilia_2020
+# MAGIC USING DELTA
+# MAGIC LOCATION 's3a://Veeva/PT/Hemophilia_2020';
+
+# COMMAND ----------
+
+spark.sql("CREATE TABLE com_us_lake.Veeva_PT_HAE_2020 USING DELTA LOCATION 's3a://Veeva/PT/HAE_2020'")
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC OPTIMIZE com_us_lake.Veeva_PT_HAE_2020  
+# MAGIC   ZORDER BY (patient_id)
+# MAGIC   
+# MAGIC OPTIMIZE com_us_lake.Veeva_PT_Hemophilia_2020  
+# MAGIC   ZORDER BY (patient_id)    
